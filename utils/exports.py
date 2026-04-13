@@ -17,6 +17,31 @@ def prepare_ranked_export(df: pd.DataFrame) -> pd.DataFrame:
 
 def prepare_schools_export(df: pd.DataFrame) -> pd.DataFrame:
     """Column order for school list CSV (internal names)."""
-    cols = ["school_name", "district_name", "address", "city", "state", "zip_code", "enrollment", "grades"]
+    cols = [
+        "school_name",
+        "district_name",
+        "address",
+        "city",
+        "state",
+        "zip_code",
+        "enrollment",
+        "grades",
+        "school_type",
+        "charter_status",
+        "operational_status",
+        "ncessch",
+        "phone",
+        "website",
+        "is_public_school",
+        "athletics_budget_proxy",
+        "athletics_budget_proxy_source",
+        "booster_exists",
+        "booster_match_confidence",
+        "latest_booster_revenue",
+        "latest_booster_net_assets",
+        "latest_booster_tax_year",
+        "matched_org_name",
+        "matched_ein",
+    ]
     existing = [c for c in cols if c in df.columns]
     return df[existing] if existing else df

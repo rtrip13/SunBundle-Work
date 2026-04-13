@@ -21,6 +21,11 @@ SCORING_DIRECTION = {
     "school_count": True,
     "density": True,
     "distance_to_ann_arbor_miles": False,  # closer = better
+    "distance_to_reference_miles": False,  # closer = better
+    "athletics_budget_proxy_zip": True,  # proxy only; not exact athletics spend
+    "booster_exists_zip": True,
+    "latest_booster_revenue_zip": True,
+    "booster_match_confidence_zip": True,
 }
 
 
@@ -108,10 +113,29 @@ def run_scoring(
         need_w = overall_need_weight / total_overall
         feas_w = overall_feasibility_weight / total_overall
 
-    total_score = need_w * need_score + feas_w * feas_score
+    base_total_score = need_w * need_score + feas_w * feas_score
+
+    # Funding/booster layer (proxy-based, not exact school-level athletics spending).
+    funding_metrics = {
+        "athletics_budget_proxy_zip": 0.35,
+        "booster_exists_zip": 0.20,
+        "latest_booster_revenue_zip": 0.35,
+        "booster_match_confidence_zip": 0.10,
+    }
+    funding_score = _component_score(df, funding_metrics, "funding_signal")
+
+    # Confidence penalty for weak EO BMF matches.
+    confidence = df.get("booster_match_confidence_zip", pd.Series(0.0, index=df.index)).fillna(0).astype(float)
+    confidence_penalty = (1.0 - confidence).clip(lower=0, upper=1)
+    funding_score = (funding_score - 0.20 * confidence_penalty).clip(lower=0, upper=1)
+
+    # Blend core score + funding/booster layer.
+    total_score = 0.80 * base_total_score + 0.20 * funding_score
     result = df.copy()
     result["need_score"] = need_score
     result["feasibility_score"] = feas_score
+    result["funding_signal_score"] = funding_score
+    result["confidence_penalty"] = confidence_penalty
     result["total_score"] = total_score
     return result
 

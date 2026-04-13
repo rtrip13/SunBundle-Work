@@ -6,15 +6,39 @@ Tooltip shows total, need, feasibility scores and key drivers (poverty, income, 
 from __future__ import annotations
 
 import copy
+import json
+import urllib.request
 from typing import Optional
 
 import pandas as pd
+
+# Light context for nationwide maps (no fill; state borders only).
+_US_STATES_GEOJSON_URL = (
+    "https://raw.githubusercontent.com/PublicaMundi/MappingAPI/master/data/geojson/us-states.json"
+)
 
 try:
     import folium
     from folium.features import GeoJsonTooltip
 except ImportError:  # pragma: no cover - handled at runtime
     folium = None
+    GeoJsonTooltip = None  # type: ignore[misc, assignment]
+
+
+def _ensure_folium() -> bool:
+    """Late-import folium if it was missing at module load (e.g. venv activated later)."""
+    global folium, GeoJsonTooltip
+    if folium is not None:
+        return True
+    try:
+        import folium as _f  # type: ignore
+        from folium.features import GeoJsonTooltip as _G  # type: ignore
+
+        folium = _f
+        GeoJsonTooltip = _G
+        return True
+    except Exception:
+        return False
 
 # Center on US for nationwide ACS data
 DEFAULT_CENTER = [39.0, -98.0]
@@ -57,17 +81,8 @@ def build_choropleth(
     Build folium choropleth.
     Returns None only if folium is not available or there is no scored data.
     """
-    if folium is None:
-        # Try a late import in case folium was installed after module import
-        try:
-            import folium as _f  # type: ignore
-            from folium.features import GeoJsonTooltip as _G  # type: ignore
-
-            globals()["folium"] = _f
-            globals()["GeoJsonTooltip"] = _G
-        except Exception:
-            # Folium really isn't available; skip map instead of crashing
-            return None
+    if not _ensure_folium():
+        return None
 
     if scored_df is None or len(scored_df) == 0:
         return None
@@ -137,6 +152,8 @@ def build_choropleth(
     ]
 
     m = folium.Map(location=DEFAULT_CENTER, zoom_start=DEFAULT_ZOOM, tiles="CartoDB positron")
+    _add_us_state_outlines(m)
+
     folium.Choropleth(
         geo_data=geojson,
         name="Score",
@@ -147,7 +164,8 @@ def build_choropleth(
         fill_opacity=0.6,
         line_opacity=0.3,
         legend_name="Expansion score (0–1)",
-        nan_fill_color="white",
+        # Light gray: ZIPs in the basemap but outside the current scored/filtered set.
+        nan_fill_color="#ececec",
     ).add_to(m)
 
     tip = GeoJsonTooltip(fields=tooltip_fields, aliases=aliases, localize=True)
@@ -159,6 +177,32 @@ def build_choropleth(
 
     folium.LayerControl().add_to(m)
     return m
+
+
+def _add_us_state_outlines(map_obj) -> None:
+    """Subtle state boundaries so gaps between ZCTAs read as geography, not 'missing app data'."""
+    if folium is None or map_obj is None:
+        return
+    try:
+        req = urllib.request.Request(
+            _US_STATES_GEOJSON_URL,
+            headers={"User-Agent": "SunBundleExpansionTool/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            states = json.loads(resp.read().decode())
+        folium.GeoJson(
+            states,
+            style_function=lambda _f: {
+                "fillColor": "#ffffff",
+                "color": "#888888",
+                "weight": 0.8,
+                "fillOpacity": 0.0,
+            },
+            name="State outlines",
+            control=False,
+        ).add_to(map_obj)
+    except Exception:
+        pass
 
 
 def add_school_markers(map_obj, schools_df: pd.DataFrame):
@@ -183,9 +227,9 @@ def add_school_markers(map_obj, schools_df: pd.DataFrame):
 
 
 def build_school_map_only(schools_df: pd.DataFrame, center: Optional[list] = None):
-    """Build map with school markers. Returns None if no schools have lat/lng."""
-    if folium is None:
-        raise ImportError("folium is required. pip install folium")
+    """Build map with school markers. Returns None if folium missing or no schools have lat/lng."""
+    if not _ensure_folium():
+        return None
     if schools_df is None or len(schools_df) == 0:
         return None
     has_coords = "latitude" in schools_df.columns and "longitude" in schools_df.columns
