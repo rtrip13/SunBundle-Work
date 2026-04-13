@@ -286,20 +286,27 @@ presets = {
 }
 
 @st.cache_data
-def load_all_data(_cache_key: tuple):
-    """Load core datasets once per session (cached).
-
-    ``_cache_key`` must come from ``data_load_cache_key()`` so adding a ZCTA shapefile
-    or updating geographies invalidates the cache (otherwise the Heatmap can stick on
-    placeholder squares forever).
-    """
+def _cached_geo_schools(_cache_key: tuple):
+    """ZIP rows + school rows. ZCTA polygons are loaded separately for the Heatmap only."""
     schools = load_schools(None)
     geo = load_geographies(schools)
-    shapes, shape_source = load_zip_shapes(geo)
-    return geo, schools, shapes, shape_source
+    return geo, schools
 
 
-geo_raw, schools_df, zip_geojson, zip_shape_source = load_all_data(data_load_cache_key())
+@st.cache_data
+def _cached_zip_shapes(_cache_key: tuple):
+    """ZCTA / placeholder GeoJSON — only needed on the Heatmap tab (can be large)."""
+    geo, _schools = _cached_geo_schools(_cache_key)
+    return load_zip_shapes(geo)
+
+
+_data_key = data_load_cache_key()
+geo_raw, schools_df = _cached_geo_schools(_data_key)
+if page == "Heatmap":
+    zip_geojson, zip_shape_source = _cached_zip_shapes(_data_key)
+else:
+    zip_geojson = {"type": "FeatureCollection", "features": []}
+    zip_shape_source = "skipped"
 
 state_options = [""]
 if "state" in geo_raw.columns and len(geo_raw) > 0:
@@ -1088,14 +1095,21 @@ elif page == "School Finder":
                 "latest_booster_tax_year",
                 "matched_org_name",
                 "matched_ein",
+                "athletics_budget_proxy_zip",
+                "booster_exists_zip",
+                "booster_match_confidence_zip",
+                "latest_booster_revenue_zip",
+                "latest_booster_net_assets_zip",
+                "latest_booster_tax_year_zip",
             ]
             detail_present = [c for c in detail_cols if c in school_list.columns]
             if detail_present:
                 with st.expander("School-level NCES fields & funding signals we matched", expanded=False):
                     st.caption(
-                        "School type and charter fields come from NCES. Athletics proxy is a **model estimate** "
-                        "for public schools (not audited spend). Booster columns come from **estimated** IRS EO BMF "
-                        "matches to support organizations."
+                        "School type and charter fields come from NCES. **Per-school** athletics proxy comes from "
+                        "NCES SLFS when the school ID matches; if it is missing, we may show the **ZIP mean** "
+                        "(same as geography scoring). **`*_zip` columns** are ZIP roll-ups across schools in that ZIP. "
+                        "Booster fields are **estimated** IRS EO BMF matches."
                     )
                     dc: dict = {}
                     if "website" in detail_present:
@@ -1115,6 +1129,18 @@ elif page == "School Finder":
                     if "athletics_budget_proxy" in detail_present:
                         dc["athletics_budget_proxy"] = st.column_config.NumberColumn(
                             "Athletics proxy ($)", format="$%d"
+                        )
+                    if "athletics_budget_proxy_zip" in detail_present:
+                        dc["athletics_budget_proxy_zip"] = st.column_config.NumberColumn(
+                            "ZIP mean proxy ($)", format="$%d"
+                        )
+                    if "latest_booster_revenue_zip" in detail_present:
+                        dc["latest_booster_revenue_zip"] = st.column_config.NumberColumn(
+                            "ZIP max booster rev ($)", format="$%d"
+                        )
+                    if "latest_booster_net_assets_zip" in detail_present:
+                        dc["latest_booster_net_assets_zip"] = st.column_config.NumberColumn(
+                            "ZIP max booster assets ($)", format="$%d"
                         )
                     if dc:
                         st.dataframe(

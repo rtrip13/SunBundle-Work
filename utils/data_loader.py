@@ -6,6 +6,8 @@ Loads:
 - data/Schools/schools.csv
 - data/Shapes/tl_*_us_zcta520.shp (optional ZCTA polygons for the Heatmap; cached as simplified GeoJSON)
 - data/acs/income.csv, data/acs/poverty.csv (median income & poverty rate)
+- data/nces/*.csv — SLFS athletics proxy (defaults to ``slfs_fy2022_school_proxy.csv``; auto-picks a matching file)
+- data/irs/*.csv — IRS EO / BMF-style nonprofits (defaults to ``eo2.csv``; column names mapped flexibly)
 """
 
 from __future__ import annotations
@@ -37,8 +39,61 @@ ACS_POVERTY_PATH = DATA_DIR / "acs" / "poverty.csv"
 SLFS_PROXY_PATH = DATA_DIR / "nces" / "slfs_fy2022_school_proxy.csv"
 BMF_PATH = DATA_DIR / "irs" / "eo2.csv"
 
+# Booster matching: name-only matches were almost never ≥ 0.55 vs IRS org names.
+_BOOSTER_CONF_NAME_MATCH = 0.40
+_BOOSTER_CONF_ZIP_HEURISTIC = 0.38
+_BOOSTER_CONF_ZIP_BROAD = 0.30
+
 # Ann Arbor coordinates for distance calculation
 ANN_ARBOR_LAT, ANN_ARBOR_LON = 42.2808, -83.7430
+
+
+def _discover_slfs_proxy_path() -> Path | None:
+    """Prefer ``SLFS_PROXY_PATH``; else ``data/nces/*.csv`` with SLFS columns."""
+    if SLFS_PROXY_PATH.exists():
+        return SLFS_PROXY_PATH
+    d = DATA_DIR / "nces"
+    if not d.is_dir():
+        return None
+    cands = sorted(d.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for c in cands:
+        try:
+            hdr = pd.read_csv(c, nrows=0)
+            cols = {str(x).strip().lower() for x in hdr.columns}
+            if "ncessch" in cols and "athletics_budget_proxy" in cols:
+                return c
+        except Exception:
+            continue
+    for c in cands:
+        low = c.name.lower()
+        if any(k in low for k in ("slfs", "proxy", "athletic", "nces")):
+            try:
+                hdr = pd.read_csv(c, nrows=0)
+                cols = {str(x).strip().lower() for x in hdr.columns}
+                if "ncessch" in cols and "athletics_budget_proxy" in cols:
+                    return c
+            except Exception:
+                continue
+    return None
+
+
+def _discover_bmf_path() -> Path | None:
+    """Prefer ``BMF_PATH``; else ``data/irs/*.csv`` that looks like an EO/BMF extract."""
+    if BMF_PATH.exists():
+        return BMF_PATH
+    d = DATA_DIR / "irs"
+    if not d.is_dir():
+        return None
+    cands = sorted(d.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for c in cands:
+        try:
+            hdr = pd.read_csv(c, nrows=0)
+            cols = {str(x).strip().lower() for x in hdr.columns}
+            if "ein" in cols and "name" in cols and ("zip" in cols or "zip_code" in cols or "mailing_zip" in cols):
+                return c
+        except Exception:
+            continue
+    return cands[0] if cands else None
 
 
 def _resolve_zcta_shapefile() -> Path | None:
@@ -76,6 +131,8 @@ def data_load_cache_key() -> tuple:
     keep serving placeholder squares forever after you add ``tl_*_us_zcta*.shp``.
     """
     shp = _resolve_zcta_shapefile()
+    slfs = _discover_slfs_proxy_path()
+    bmf = _discover_bmf_path()
     return (
         _mtime_or_missing(GEOGRAPHIES_PATH),
         _mtime_or_missing(SCHOOLS_PATH),
@@ -83,6 +140,12 @@ def data_load_cache_key() -> tuple:
         _mtime_or_missing(shp) if shp is not None else -1.0,
         _mtime_or_missing(SHAPE_GEOJSON_PATH),
         float(ZCTA_FOLIUM_SIMPLIFY_DEGREES),
+        _mtime_or_missing(slfs) if slfs is not None else -1.0,
+        str(slfs.resolve()) if slfs is not None else "",
+        _mtime_or_missing(bmf) if bmf is not None else -1.0,
+        str(bmf.resolve()) if bmf is not None else "",
+        _mtime_or_missing(ACS_INCOME_PATH),
+        _mtime_or_missing(ACS_POVERTY_PATH),
     )
 
 
@@ -135,6 +198,28 @@ def _zip_to_string(series: pd.Series) -> pd.Series:
     s = series.astype(str).str.strip()
     mask = s.str.match(r"^\d+$") & (s.str.len() <= 5)
     return s.where(~mask, s.str.zfill(5))
+
+
+def _zip_scalar(z: object) -> str:
+    """Normalize a single ZIP to 5 characters for joins and BMF (STATE, ZIP) keys."""
+    if z is None or (isinstance(z, float) and pd.isna(z)):
+        return ""
+    s = _zip_to_string(pd.Series([str(z).strip()])).iloc[0]
+    if not isinstance(s, str) or not s:
+        return ""
+    return s.strip().zfill(5)[:5]
+
+
+def _normalize_ncessch_id(series: pd.Series) -> pd.Series:
+    """
+    Align NCES school IDs across files (strip, drop trailing ``.0`` from floats, 12-digit zfill).
+    """
+    s = series.astype(str).str.strip()
+    s = s.replace({"nan": "", "None": "", "<NA>": ""})
+    s = s.str.replace(r"\.0$", "", regex=True)
+    mask = s.str.match(r"^\d+$") & (s.str.len() > 0) & (s.str.len() < 12)
+    s = s.where(~mask, s.str.zfill(12))
+    return s
 
 
 def _extract_zip_from_name(name: str) -> str:
@@ -243,7 +328,9 @@ def _load_real_geographies() -> pd.DataFrame:
 
 def _load_real_schools() -> pd.DataFrame:
     """Load schools CSV and map to internal schema. Use MZIP/LZIP for ZIP lookup."""
-    df = pd.read_csv(SCHOOLS_PATH, dtype={"MZIP": str, "LZIP": str}, low_memory=False)
+    _header = pd.read_csv(SCHOOLS_PATH, nrows=0)
+    _dtype = {k: str for k in ("MZIP", "LZIP", "NCESSCH") if k in _header.columns}
+    df = pd.read_csv(SCHOOLS_PATH, dtype=_dtype, low_memory=False)
     zip_col = df["MZIP"].copy()
     if "LZIP" in df.columns:
         zip_col = zip_col.fillna(df["LZIP"])
@@ -282,7 +369,21 @@ def _load_real_schools() -> pd.DataFrame:
     else:
         df["ncessch"] = ""
     sch_type = df.get("SCH_TYPE_TEXT", "").astype(str).str.lower()
-    df["is_public_school"] = sch_type.str.contains("public|regular", na=False)
+    charter_yes = (
+        df.get("CHARTER_TEXT", pd.Series("", index=df.index))
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .str.lower()
+        .eq("yes")
+    )
+    not_private = ~sch_type.str.contains("private", na=False)
+    # NCES often labels public schools as "Regular School" without the word "public".
+    looks_public = sch_type.str.contains(
+        r"public|regular school|^charter|alternative|special education|juvenile|vocational",
+        na=False,
+    )
+    df["is_public_school"] = not_private & (looks_public | charter_yes)
     df["school_type"] = df.get("SCH_TYPE_TEXT", "").fillna("").astype(str).str.strip()
     df["charter_status"] = df.get("CHARTER_TEXT", "").fillna("").astype(str).str.strip()
     df["operational_status"] = df.get("SY_STATUS_TEXT", "").fillna("").astype(str).str.strip()
@@ -302,56 +403,145 @@ def _load_slfs_proxy() -> pd.DataFrame | None:
     Load NCES SLFS FY2022-derived school proxy file.
     Required columns: ncessch, athletics_budget_proxy.
     """
-    if not SLFS_PROXY_PATH.exists():
+    path = _discover_slfs_proxy_path()
+    if path is None:
         return None
     try:
-        df = pd.read_csv(SLFS_PROXY_PATH, dtype=str)
+        df = pd.read_csv(path, dtype=str, low_memory=False)
     except Exception:
         return None
-    cols = {c.lower(): c for c in df.columns}
+    cols = {str(c).strip().lower(): c for c in df.columns}
     id_col = cols.get("ncessch")
     proxy_col = cols.get("athletics_budget_proxy")
     if not id_col or not proxy_col:
         return None
     out = df[[id_col, proxy_col]].copy()
     out.columns = ["ncessch", "athletics_budget_proxy"]
-    out["ncessch"] = out["ncessch"].astype(str).str.strip()
+    out["ncessch"] = _normalize_ncessch_id(out["ncessch"])
     out["athletics_budget_proxy"] = pd.to_numeric(out["athletics_budget_proxy"], errors="coerce")
     out["athletics_budget_proxy_source"] = "NCES_SLFS_FY2022"
     return out
 
 
-def _load_bmf() -> pd.DataFrame | None:
-    """Load IRS EO BMF only from ``data/irs/eo2.csv`` (no silent fallback paths)."""
-    if not BMF_PATH.exists():
+def _bmf_column_lookup(df: pd.DataFrame) -> dict[str, str]:
+    """Map canonical names to actual column names (case-insensitive)."""
+    lower = {str(c).strip().lower(): c for c in df.columns}
+
+    def one(*candidates: str) -> str | None:
+        for c in candidates:
+            if c.lower() in lower:
+                return lower[c.lower()]
         return None
-    usecols = [
-        "EIN",
-        "NAME",
-        "CITY",
-        "STATE",
-        "ZIP",
-        "REVENUE_AMT",
-        "ASSET_AMT",
-        "TAX_PERIOD",
-        "FILING_REQ_CD",
-        "NTEE_CD",
-        "STATUS",
-        "SUBSECTION",
-    ]
+
+    return {
+        "EIN": one("ein"),
+        "NAME": one("name", "org_name", "organization_name"),
+        "CITY": one("city", "mail_city"),
+        "STATE": one("state", "st", "mail_state"),
+        "ZIP": one("zip", "zip_code", "zip5", "mail_zip", "mailing_zip"),
+        "REVENUE_AMT": one(
+            "revenue_amt",
+            "revenue",
+            "income_amt",
+            "income",
+            "cy_total_revenue_amt",
+            "total_revenue",
+        ),
+        "ASSET_AMT": one("asset_amt", "assets", "total_assets", "asset_amount"),
+        "TAX_PERIOD": one("tax_period", "tax_yr", "tax_year"),
+        "NTEE_CD": one("ntee_cd", "ntee_code", "ntee"),
+    }
+
+
+def _load_bmf() -> pd.DataFrame | None:
+    """Load IRS EO / BMF-style extract from ``data/irs/`` (flexible filename and columns)."""
+    path = _discover_bmf_path()
+    if path is None:
+        return None
     try:
-        df = pd.read_csv(BMF_PATH, dtype=str, usecols=usecols, low_memory=False)
+        df = pd.read_csv(path, dtype=str, low_memory=False, on_bad_lines="skip")
+    except TypeError:
+        try:
+            df = pd.read_csv(path, dtype=str, low_memory=False)
+        except Exception:
+            return None
     except Exception:
         return None
-    df["ZIP"] = _zip_to_string(df["ZIP"].fillna("").astype(str).str[:5])
-    df["CITY"] = df["CITY"].fillna("").astype(str).str.strip().str.lower()
-    df["STATE"] = df["STATE"].fillna("").astype(str).str.strip().str.upper()
-    df["NAME"] = df["NAME"].fillna("").astype(str).str.strip()
-    df["name_norm"] = df["NAME"].map(_normalize_name)
-    for col in ("REVENUE_AMT", "ASSET_AMT"):
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    df["tax_year"] = df["TAX_PERIOD"].map(_parse_tax_year)
-    return df
+    if len(df) == 0:
+        return None
+
+    lk = _bmf_column_lookup(df)
+    required = ("EIN", "NAME", "CITY", "STATE", "ZIP")
+    if any(lk.get(k) is None for k in required):
+        return None
+
+    out = pd.DataFrame()
+    for canon in required + ("REVENUE_AMT", "ASSET_AMT", "TAX_PERIOD", "NTEE_CD"):
+        src = lk.get(canon)
+        if src is not None:
+            out[canon] = df[src]
+        elif canon == "REVENUE_AMT":
+            out[canon] = np.nan
+        elif canon == "ASSET_AMT":
+            out[canon] = np.nan
+        elif canon == "TAX_PERIOD":
+            out[canon] = ""
+        elif canon == "NTEE_CD":
+            out[canon] = ""
+
+    z = out["ZIP"].fillna("").astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+    z = z.str.replace(r"[^0-9]", "", regex=True).str.slice(0, 5)
+    out["ZIP"] = _zip_to_string(z)
+    out["CITY"] = out["CITY"].fillna("").astype(str).str.strip().str.lower()
+    out["STATE"] = out["STATE"].fillna("").astype(str).str.strip().str.upper()
+    out["NAME"] = out["NAME"].fillna("").astype(str).str.strip()
+    out["name_norm"] = out["NAME"].map(_normalize_name)
+    out["REVENUE_AMT"] = pd.to_numeric(out["REVENUE_AMT"], errors="coerce")
+    out["ASSET_AMT"] = pd.to_numeric(out["ASSET_AMT"], errors="coerce")
+    out["tax_year"] = out["TAX_PERIOD"].map(_parse_tax_year)
+    out = out[out["STATE"].astype(str).str.len() == 2]
+    out = out[out["ZIP"].astype(str).str.match(r"^\d{5}$", na=False)]
+    return out
+
+
+def _likely_school_support_booster_mask(df: pd.DataFrame) -> pd.Series:
+    """Heuristic: org name / NTEE looks like PTA, booster, athletics, or school support."""
+    name = df["NAME"].fillna("").astype(str).str.lower()
+    ntee = df.get("NTEE_CD", pd.Series("", index=df.index)).fillna("").astype(str).str.upper()
+    pat = (
+        r"\bpta\b|p\.t\.a|parent.?teacher|booster|athletic|athletics|\bsports\b|"
+        r"football|basketball|soccer|baseball|softball|volleyball|wrestling|lacrosse|"
+        r"gridiron|cheer|band|orchestra|marching|drill|student.?athlete|"
+        r"school.?foundation|education.?foundation|friends.?of|alumni|grid|club"
+    )
+    m_name = name.str.contains(pat, regex=True, na=False)
+    m_ntee = ntee.str.match(r"^B[0-9]", na=False) | ntee.isin(
+        ["N69", "O50", "O52", "P20", "P30", "P40", "P50", "P60"]
+    )
+    return m_name | m_ntee
+
+
+def _pick_best_booster_row_by_revenue(df: pd.DataFrame) -> pd.Series | None:
+    if df is None or len(df) == 0:
+        return None
+    rev = pd.to_numeric(df["REVENUE_AMT"], errors="coerce").fillna(0.0)
+    if rev.max() <= 0:
+        return None
+    idx = rev.idxmax()
+    return df.loc[idx]
+
+
+def _booster_match_dict_from_row(row: pd.Series, conf: float) -> dict[str, object]:
+    return {
+        "booster_exists": True,
+        "booster_match_confidence": float(conf),
+        "matched_org_name": str(row.get("NAME", "")),
+        "matched_ein": str(row.get("EIN", "")),
+        "latest_booster_revenue": row.get("REVENUE_AMT", np.nan),
+        "latest_booster_expenses": np.nan,
+        "latest_booster_net_assets": row.get("ASSET_AMT", np.nan),
+        "latest_booster_tax_year": row.get("tax_year", np.nan),
+    }
 
 
 def _resolve_booster_loc(
@@ -390,47 +580,70 @@ def _match_booster_for_school(
     zip5: str,
     loc: pd.DataFrame,
 ) -> dict[str, object]:
+    empty = {
+        "booster_exists": False,
+        "booster_match_confidence": 0.0,
+        "matched_org_name": "",
+        "matched_ein": "",
+        "latest_booster_revenue": np.nan,
+        "latest_booster_expenses": np.nan,
+        "latest_booster_net_assets": np.nan,
+        "latest_booster_tax_year": np.nan,
+    }
     if loc.empty:
-        return {
-            "booster_exists": False,
-            "booster_match_confidence": 0.0,
-            "matched_org_name": "",
-            "matched_ein": "",
-            "latest_booster_revenue": np.nan,
-            "latest_booster_expenses": np.nan,
-            "latest_booster_net_assets": np.nan,
-            "latest_booster_tax_year": np.nan,
-        }
+        return empty
+
+    zip5 = _zip_scalar(zip5)
+    if not zip5:
+        return empty
+
     school_name_norm = _normalize_name(school_name)
     city = str(city).strip().lower()
     state = str(state).strip().upper()
-    zip5 = str(zip5).strip()[:5]
 
-    scored = loc.copy()
-    scored["name_score"] = scored["name_norm"].map(lambda s: _token_overlap_score(school_name_norm, s))
-    scored["city_score"] = (scored["CITY"] == city).astype(float)
-    scored["zip_score"] = (scored["ZIP"] == zip5).astype(float)
-    scored["state_score"] = (scored["STATE"] == state).astype(float)
-    scored["booster_match_confidence"] = (
-        0.55 * scored["name_score"] + 0.20 * scored["city_score"] + 0.15 * scored["zip_score"] + 0.10 * scored["state_score"]
+    # Always score **same-ZIP** EO rows only so we never attach an unrelated large org elsewhere in the state.
+    loc_zip = loc["ZIP"].astype(str).str.strip().str.zfill(5).str.slice(0, 5)
+    zip_rows = loc[loc_zip == zip5].copy()
+    if zip_rows.empty:
+        return empty
+
+    zip_rows["name_score"] = zip_rows["name_norm"].map(lambda s: _token_overlap_score(school_name_norm, s))
+    zip_rows["city_score"] = (zip_rows["CITY"] == city).astype(float)
+    zip_rows["zip_score"] = 1.0
+    zip_rows["state_score"] = (zip_rows["STATE"] == state).astype(float)
+    zip_rows["booster_match_confidence"] = (
+        0.50 * zip_rows["name_score"]
+        + 0.22 * zip_rows["city_score"]
+        + 0.18 * zip_rows["zip_score"]
+        + 0.10 * zip_rows["state_score"]
     )
-    best = scored.sort_values("booster_match_confidence", ascending=False).iloc[0]
+    best = zip_rows.sort_values("booster_match_confidence", ascending=False).iloc[0]
     conf = float(best["booster_match_confidence"])
-    exists = conf >= 0.55
-    return {
-        "booster_exists": bool(exists),
-        "booster_match_confidence": conf,
-        "matched_org_name": str(best.get("NAME", "")) if exists else "",
-        "matched_ein": str(best.get("EIN", "")) if exists else "",
-        "latest_booster_revenue": best.get("REVENUE_AMT", np.nan) if exists else np.nan,
-        "latest_booster_expenses": np.nan,  # not present in EO BMF flat file
-        "latest_booster_net_assets": best.get("ASSET_AMT", np.nan) if exists else np.nan,
-        "latest_booster_tax_year": best.get("tax_year", np.nan) if exists else np.nan,
-    }
+    if conf >= _BOOSTER_CONF_NAME_MATCH:
+        return _booster_match_dict_from_row(best, conf)
+
+    # Heuristic: PTA / booster / athletics language or education NTEE → strongest revenue in ZIP.
+    mask = _likely_school_support_booster_mask(zip_rows)
+    pool = zip_rows[mask] if mask.any() else zip_rows
+    pick = _pick_best_booster_row_by_revenue(pool)
+    conf_hz = _BOOSTER_CONF_ZIP_HEURISTIC
+    if pick is None:
+        pick = _pick_best_booster_row_by_revenue(zip_rows)
+        conf_hz = _BOOSTER_CONF_ZIP_BROAD
+    if pick is None:
+        return empty
+
+    rev = pd.to_numeric(pick.get("REVENUE_AMT"), errors="coerce")
+    if pd.isna(rev) or float(rev) <= 0:
+        return empty
+
+    return _booster_match_dict_from_row(pick, max(conf, conf_hz))
 
 
-def _enrich_school_funding_fields(schools: pd.DataFrame) -> pd.DataFrame:
+def _enrich_school_funding_fields(schools: pd.DataFrame, *, match_boosters: bool = True) -> pd.DataFrame:
     out = schools.copy()
+    if len(out) == 0:
+        return out
     out["zip_code"] = _zip_to_string(out["zip_code"])
     if "city" not in out.columns:
         out["city"] = ""
@@ -442,20 +655,23 @@ def _enrich_school_funding_fields(schools: pd.DataFrame) -> pd.DataFrame:
     out["state"] = out["state"].astype(str).str.strip().str.upper()
     out["is_public_school"] = out["is_public_school"].fillna(False).astype(bool)
 
+    if "ncessch" in out.columns:
+        out["ncessch"] = _normalize_ncessch_id(out["ncessch"])
+
     out["athletics_budget_proxy"] = np.nan
     out["athletics_budget_proxy_source"] = ""
-    out.loc[out["is_public_school"], "athletics_budget_proxy_source"] = "NCES_SLFS_FY2022"
     slfs = _load_slfs_proxy()
     if slfs is not None and "ncessch" in out.columns:
         out = out.merge(slfs, on="ncessch", how="left", suffixes=("", "_slfs"))
-        # Use NCES SLFS proxy only for public schools.
+        # Use NCES SLFS proxy only for public schools; label source only when SLFS row exists.
+        has_slfs = out["athletics_budget_proxy_slfs"].notna()
         out["athletics_budget_proxy"] = np.where(
             out["is_public_school"],
             out["athletics_budget_proxy_slfs"],
             np.nan,
         )
         out["athletics_budget_proxy_source"] = np.where(
-            out["is_public_school"],
+            out["is_public_school"] & has_slfs,
             "NCES_SLFS_FY2022",
             "",
         )
@@ -474,28 +690,76 @@ def _enrich_school_funding_fields(schools: pd.DataFrame) -> pd.DataFrame:
     out["latest_booster_net_assets"] = np.nan
     out["latest_booster_tax_year"] = np.nan
 
-    bmf = _load_bmf()
-    if bmf is None or len(out) == 0:
-        return out
+    bmf = _load_bmf() if match_boosters else None
+    if bmf is not None:
+        empty = bmf.iloc[:0]
+        gz = bmf.groupby(["STATE", "ZIP"], sort=False)
+        gs = bmf.groupby("STATE", sort=False)
+        sz_cache: dict[tuple[str, str], pd.DataFrame] = {}
+        state_cache: dict[str, pd.DataFrame] = {}
 
-    empty = bmf.iloc[:0]
-    gz = bmf.groupby(["STATE", "ZIP"], sort=False)
-    gs = bmf.groupby("STATE", sort=False)
-    sz_cache: dict[tuple[str, str], pd.DataFrame] = {}
-    state_cache: dict[str, pd.DataFrame] = {}
+        merged_rows: list[dict[str, object]] = []
+        for row in out.itertuples(index=False):
+            st = str(getattr(row, "state", "") or "").strip().upper()
+            zp = _zip_scalar(getattr(row, "zip_code", ""))
+            cty = str(getattr(row, "city", "") or "").strip().lower()
+            loc = _resolve_booster_loc(st, zp, cty, gz, gs, sz_cache, state_cache, empty)
+            merged_rows.append(
+                _match_booster_for_school(getattr(row, "school_name", ""), cty, st, zp, loc)
+            )
+        match_df = pd.DataFrame(merged_rows, index=out.index)
+        for c in match_df.columns:
+            out[c] = match_df[c]
 
-    merged_rows: list[dict[str, object]] = []
-    for row in out.itertuples(index=False):
-        st = str(getattr(row, "state", "") or "").strip().upper()
-        zp = str(getattr(row, "zip_code", "") or "").strip()[:5]
-        cty = str(getattr(row, "city", "") or "").strip().lower()
-        loc = _resolve_booster_loc(st, zp, cty, gz, gs, sz_cache, state_cache, empty)
-        merged_rows.append(
-            _match_booster_for_school(getattr(row, "school_name", ""), cty, st, zp, loc)
+    # --- Athletics proxy: ensure every **public** school has a dollar value ($) for reporting ---
+    # 1) Peer ZIP mean: other public schools in this ZIP that already have SLFS (same NCES file).
+    peers = out[out["is_public_school"] & out["athletics_budget_proxy"].notna()]
+    if len(peers) > 0:
+        peer_zip_mean = peers.groupby("zip_code", as_index=False)["athletics_budget_proxy"].mean()
+        peer_zip_mean = peer_zip_mean.rename(columns={"athletics_budget_proxy": "_peer_zip_mean_proxy"})
+        out = out.merge(peer_zip_mean, on="zip_code", how="left")
+    else:
+        out["_peer_zip_mean_proxy"] = np.nan
+
+    need_peer = out["is_public_school"] & out["athletics_budget_proxy"].isna() & out["_peer_zip_mean_proxy"].notna()
+    out.loc[need_peer, "athletics_budget_proxy"] = out.loc[need_peer, "_peer_zip_mean_proxy"]
+    src_peer = out.loc[need_peer, "athletics_budget_proxy_source"].astype(str)
+    out.loc[need_peer, "athletics_budget_proxy_source"] = np.where(
+        src_peer.str.strip().isin(("", "nan", "None")),
+        "ZIP_PEER_MEAN_SLFS",
+        src_peer,
+    )
+    out = out.drop(columns=["_peer_zip_mean_proxy"], errors="ignore")
+
+    # 2) Dataset-wide median of public proxies (covers ZIPs with no SLFS peers at all).
+    med = out.loc[out["is_public_school"], "athletics_budget_proxy"].median()
+    if pd.isna(med):
+        med = 0.0
+    need_med = out["is_public_school"] & out["athletics_budget_proxy"].isna()
+    if need_med.any():
+        out.loc[need_med, "athletics_budget_proxy"] = float(med)
+        src_m = out.loc[need_med, "athletics_budget_proxy_source"].astype(str)
+        out.loc[need_med, "athletics_budget_proxy_source"] = np.where(
+            src_m.str.strip().isin(("", "nan", "None")),
+            "GLOBAL_MEDIAN_PUBLIC_PROXY",
+            src_m,
         )
-    match_df = pd.DataFrame(merged_rows, index=out.index)
-    for c in match_df.columns:
-        out[c] = match_df[c]
+
+    # 3) ZIP-level aggregates (geography + exports): single merge after all per-school proxies are final.
+    zip_agg_cols = [
+        "athletics_budget_proxy_zip",
+        "booster_exists_zip",
+        "booster_match_confidence_zip",
+        "latest_booster_revenue_zip",
+        "latest_booster_net_assets_zip",
+        "latest_booster_tax_year_zip",
+    ]
+    for c in zip_agg_cols:
+        if c in out.columns:
+            out = out.drop(columns=[c], errors="ignore")
+    zip_sigs = _aggregate_school_funding_signals(out)
+    out = out.merge(zip_sigs, on="zip_code", how="left")
+
     return out
 
 
@@ -512,8 +776,9 @@ def _aggregate_school_funding_signals(schools: pd.DataFrame) -> pd.DataFrame:
         athletics_budget_proxy_zip=("athletics_budget_proxy", "mean"),
         booster_exists_zip=("booster_exists", "max"),
         booster_match_confidence_zip=("booster_match_confidence", "mean"),
-        latest_booster_revenue_zip=("latest_booster_revenue", "sum"),
-        latest_booster_net_assets_zip=("latest_booster_net_assets", "sum"),
+        # max avoids inflating ZIP totals when many schools inherit the same ZIP-level match.
+        latest_booster_revenue_zip=("latest_booster_revenue", "max"),
+        latest_booster_net_assets_zip=("latest_booster_net_assets", "max"),
         latest_booster_tax_year_zip=("latest_booster_tax_year", "max"),
     ).reset_index()
     agg["booster_exists_zip"] = agg["booster_exists_zip"].fillna(False).astype(bool)
@@ -584,18 +849,22 @@ def _generate_dummy_schools(geographies: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def load_schools(geographies: pd.DataFrame | None = None) -> pd.DataFrame:
-    """Load schools with internal column names."""
+def load_schools(geographies: pd.DataFrame | None = None, *, match_boosters: bool = True) -> pd.DataFrame:
+    """Load schools with internal column names.
+
+    ``match_boosters=False`` skips IRS EO/BMF row matching (much faster for scripts;
+    booster columns stay at defaults).
+    """
     if SCHOOLS_PATH.exists():
         df = _load_real_schools()
     else:
         geo = geographies if geographies is not None else _generate_dummy_geographies()
         df = _generate_dummy_schools(geo)
     df["zip_code"] = _zip_to_string(df["zip_code"])
-    return _enrich_school_funding_fields(df)
+    return _enrich_school_funding_fields(df, match_boosters=match_boosters)
 
 
-def load_geographies(schools: pd.DataFrame | None = None) -> pd.DataFrame:
+def load_geographies(schools: pd.DataFrame | None = None, *, match_boosters: bool = True) -> pd.DataFrame:
     """Load geographies, enrich with ACS, and compute school_count and distance."""
     if GEOGRAPHIES_PATH.exists():
         df = _load_real_geographies()
@@ -603,7 +872,7 @@ def load_geographies(schools: pd.DataFrame | None = None) -> pd.DataFrame:
         df = _generate_dummy_geographies()
 
     if schools is None:
-        schools = load_schools(df)
+        schools = load_schools(df, match_boosters=match_boosters)
     df["school_count"] = _compute_school_count(df, schools)
     df["distance_to_ann_arbor_miles"] = _compute_distance_to_ann_arbor(df)
     funding = _aggregate_school_funding_signals(schools)
@@ -810,5 +1079,11 @@ def get_school_columns() -> list[str]:
         "latest_booster_expenses",
         "latest_booster_net_assets",
         "latest_booster_tax_year",
+        "athletics_budget_proxy_zip",
+        "booster_exists_zip",
+        "booster_match_confidence_zip",
+        "latest_booster_revenue_zip",
+        "latest_booster_net_assets_zip",
+        "latest_booster_tax_year_zip",
     ]
 

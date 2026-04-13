@@ -212,25 +212,25 @@ IRS **EO BMF** (`eo2`-style extract).
 """,
     "latest_booster_revenue_zip": """
 ### What it is
-**Added-up revenue** (`REVENUE_AMT` from EO BMF) for **matched** orgs tied to schools in this ZIP.
+**Largest single-school matched revenue** in the ZIP (`REVENUE_AMT` from EO BMF) — we take the **max** across schools so the ZIP figure is **not inflated** when many schools share one booster-style org.
 
 ### Intuition
 Think “**rough size signal** from tax-exempt org filings,” not audited athletic income.
 
 ### Important caveat
-If two schools accidentally match the **same** org, or the match is wrong, this number can **double-count or overstate** — use it as a **clue**, not a fact.
+The underlying match is still a **heuristic** (name / ZIP / keywords) — use it as a **clue**, not a fact.
 
 ### Source
-IRS EO BMF; **not** full Form 990 line-by-line parsing in this MVP.
+IRS EO BMF–style extract (`data/irs/*.csv`); **not** full Form 990 line-by-line parsing in this MVP.
 """,
     "latest_booster_net_assets_zip": """
 ### What it is
-**Sum of asset amounts** (`ASSET_AMT`) from matched EO BMF rows for schools in the ZIP — a **balance-sheet size** hint.
+**Largest matched asset amount** in the ZIP (`ASSET_AMT`) — same **max** rollup idea as revenue so one shared org is not summed many times.
 
 ### May not appear in the main table
 Sometimes kept in exports or future columns; the **logic** is the same as revenue: **helpful signal, not ground truth**.
 
 ### Caveat
-Same **double-count / mismatch** risks as revenue if multiple schools hit the same organization.
+Matches can still be **wrong or loose** for any given school — treat as triage, not verification.
 """,
 }

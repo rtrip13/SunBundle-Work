@@ -42,6 +42,12 @@ def prepare_schools_export(df: pd.DataFrame) -> pd.DataFrame:
         "latest_booster_tax_year",
         "matched_org_name",
         "matched_ein",
+        "athletics_budget_proxy_zip",
+        "booster_exists_zip",
+        "booster_match_confidence_zip",
+        "latest_booster_revenue_zip",
+        "latest_booster_net_assets_zip",
+        "latest_booster_tax_year_zip",
     ]
     existing = [c for c in cols if c in df.columns]
     return df[existing] if existing else df
