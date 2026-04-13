@@ -5,3 +5,5 @@ __pycache__/
 .DS_Store
 data/Shapes/
 data/.cache/
+# Local full EO extract backups (huge — never commit)
+data/irs/eo2_full*.csv
