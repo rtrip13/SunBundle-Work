@@ -501,7 +501,76 @@ def _load_bmf() -> pd.DataFrame | None:
     out["tax_year"] = out["TAX_PERIOD"].map(_parse_tax_year)
     out = out[out["STATE"].astype(str).str.len() == 2]
     out = out[out["ZIP"].astype(str).str.match(r"^\d{5}$", na=False)]
+
+    # Drop rows that are almost never legitimate K-12 booster / school-support matches
+    # (hospitals, research institutes, sports halls, etc.) so ZIP-level heuristics do not latch onto them.
+    bad = _bmf_unrelated_to_k12_support_mask(out)
+    if bad.any():
+        out = out.loc[~bad].copy()
+    if len(out) == 0:
+        return None
     return out
+
+
+def _bmf_unrelated_to_k12_support_mask(df: pd.DataFrame) -> pd.Series:
+    """
+    True where an EO/BMF row should be ignored for school booster matching.
+
+    These patterns address common false positives: hospitals in the same ZIP as a school,
+    research institutes, university main campuses, sports halls of fame, United Way, etc.
+    """
+    name = df["NAME"].fillna("").astype(str)
+    n = name.str.lower()
+    ntee = (
+        df.get("NTEE_CD", pd.Series("", index=df.index))
+        .fillna("")
+        .astype(str)
+        .str.upper()
+        .str.replace(r"\s+", "", regex=True)
+        .str.slice(0, 3)
+    )
+
+    medical = n.str.contains(
+        r"\bhospital\b|\bhospitals\b|\bmedical center\b|\bmedical group\b|\bhealth ?system\b|\bhealthcare\b|"
+        r"\bhealth systems\b|\bregional health\b|\bcommunity health\b|\bphysician\b|\bphysicians\b|"
+        r"\bsurgery center\b|\burgent care\b|\bnursing home\b|\bhospice\b|\brehabilitation center\b|"
+        r"\brehab center\b|\bchildren'?s hospital\b|\bkids hospital\b|\bmedical college\b|"
+        r"\bcollege of medicine\b|\bmedical school\b|\bone ?health\b|\bcancer center\b|\bcancer institute\b|"
+        r"\bheart institute\b|\bhealth services\b|\bmedical campus\b",
+        regex=True,
+        na=False,
+    )
+    # IRS NTEE major groups: hospitals / inpatient (E2*) and many public-health orgs (E3*)
+    ntee_health_block = ntee.str.match(r"^E[23]", na=False)
+
+    hall_or_tourism = n.str.contains(
+        r"\bhall of fame\b|\bpro football hall\b|\bcooperstown\b|\bsports commission\b|"
+        r"\bvisitor'?s bureau\b|\bvisitors bureau\b|\bconvention\s+(?:and|&)\s+visitors\b|\bcvb\b",
+        regex=True,
+        na=False,
+    ) & ~n.str.contains(
+        r"\b(?:booster|school|education|pta|athletic|student|band|orchestra|alumni|gridiron)\b",
+        regex=True,
+        na=False,
+    )
+
+    research = n.str.contains(
+        r"\bresearch institute\b|\bresearch foundation\b|\bresearch corporation\b|\bresearch consortium\b|"
+        r"\bresearch triangle\b|\bfederally funded research\b|\bfederal research\b",
+        regex=True,
+        na=False,
+    )
+
+    university = n.str.contains(r"\buniversity\b", na=False) & ~n.str.contains(
+        r"\b(?:charter|public schools?|k-12|elementary|middle school|high school|"
+        r"booster|pta|alumni association|prep academy|academy cs)\b",
+        regex=True,
+        na=False,
+    )
+
+    united_way = n.str.contains(r"\bunited way\b", na=False)
+
+    return medical | ntee_health_block | hall_or_tourism | research | university | united_way
 
 
 def _likely_school_support_booster_mask(df: pd.DataFrame) -> pd.Series:
@@ -619,7 +688,9 @@ def _match_booster_for_school(
     )
     best = zip_rows.sort_values("booster_match_confidence", ascending=False).iloc[0]
     conf = float(best["booster_match_confidence"])
-    if conf >= _BOOSTER_CONF_NAME_MATCH:
+    best_rev = pd.to_numeric(best.get("REVENUE_AMT"), errors="coerce")
+    # Require positive revenue for name-based matches too (EO rows with blank revenue are not useful signals).
+    if conf >= _BOOSTER_CONF_NAME_MATCH and pd.notna(best_rev) and float(best_rev) > 0:
         return _booster_match_dict_from_row(best, conf)
 
     # Heuristic: PTA / booster / athletics language or education NTEE → strongest revenue in ZIP.
