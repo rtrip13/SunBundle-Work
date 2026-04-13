@@ -43,6 +43,8 @@ BMF_PATH = DATA_DIR / "irs" / "eo2.csv"
 _BOOSTER_CONF_NAME_MATCH = 0.40
 _BOOSTER_CONF_ZIP_HEURISTIC = 0.38
 _BOOSTER_CONF_ZIP_BROAD = 0.30
+# Use a location-level fast path for large school files to avoid multi-minute cold starts.
+_BOOSTER_FAST_MATCH_MIN_ROWS = 20000
 
 # Ann Arbor coordinates for distance calculation
 ANN_ARBOR_LAT, ANN_ARBOR_LON = 42.2808, -83.7430
@@ -711,6 +713,99 @@ def _match_booster_for_school(
     return _booster_match_dict_from_row(pick, max(conf, conf_hz))
 
 
+def _match_boosters_by_location_fast(
+    schools: pd.DataFrame,
+    gz: Any,
+    gs: Any,
+    empty: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Fast booster matching for large school datasets.
+
+    Instead of scoring every school name against every org candidate, compute one
+    best-match signal per (state, zip, city) and map back to all schools in that
+    location. This keeps ZIP-level booster signals useful while cutting startup time.
+    """
+    loc_df = schools[["state", "zip_code", "city"]].copy()
+    loc_df["state"] = loc_df["state"].fillna("").astype(str).str.strip().str.upper()
+    loc_df["zip_code"] = loc_df["zip_code"].map(_zip_scalar)
+    loc_df["city"] = loc_df["city"].fillna("").astype(str).str.strip().str.lower()
+    unique_locs = loc_df.drop_duplicates(ignore_index=True)
+
+    sz_cache: dict[tuple[str, str], pd.DataFrame] = {}
+    state_cache: dict[str, pd.DataFrame] = {}
+    rows: list[dict[str, object]] = []
+    for loc in unique_locs.itertuples(index=False):
+        st = str(loc.state)
+        zp = str(loc.zip_code)
+        cty = str(loc.city)
+        block = _resolve_booster_loc(st, zp, cty, gz, gs, sz_cache, state_cache, empty)
+        if len(block) == 0:
+            rows.append(
+                {
+                    "state": st,
+                    "zip_code": zp,
+                    "city": cty,
+                    "booster_exists": False,
+                    "booster_match_confidence": 0.0,
+                    "matched_org_name": "",
+                    "matched_ein": "",
+                    "latest_booster_revenue": np.nan,
+                    "latest_booster_expenses": np.nan,
+                    "latest_booster_net_assets": np.nan,
+                    "latest_booster_tax_year": np.nan,
+                }
+            )
+            continue
+
+        mask = _likely_school_support_booster_mask(block)
+        pool = block[mask] if mask.any() else block
+        pick = _pick_best_booster_row_by_revenue(pool)
+        conf = _BOOSTER_CONF_ZIP_HEURISTIC if pick is not None else _BOOSTER_CONF_ZIP_BROAD
+        if pick is None:
+            pick = _pick_best_booster_row_by_revenue(block)
+        if pick is None:
+            match = {
+                "booster_exists": False,
+                "booster_match_confidence": 0.0,
+                "matched_org_name": "",
+                "matched_ein": "",
+                "latest_booster_revenue": np.nan,
+                "latest_booster_expenses": np.nan,
+                "latest_booster_net_assets": np.nan,
+                "latest_booster_tax_year": np.nan,
+            }
+        else:
+            rev = pd.to_numeric(pick.get("REVENUE_AMT"), errors="coerce")
+            match = _booster_match_dict_from_row(pick, conf) if pd.notna(rev) and float(rev) > 0 else {
+                "booster_exists": False,
+                "booster_match_confidence": 0.0,
+                "matched_org_name": "",
+                "matched_ein": "",
+                "latest_booster_revenue": np.nan,
+                "latest_booster_expenses": np.nan,
+                "latest_booster_net_assets": np.nan,
+                "latest_booster_tax_year": np.nan,
+            }
+        rows.append({"state": st, "zip_code": zp, "city": cty, **match})
+
+    per_loc = pd.DataFrame(rows)
+    out = loc_df.merge(per_loc, on=["state", "zip_code", "city"], how="left")
+    out.index = schools.index
+    return out[
+        [
+            "booster_exists",
+            "booster_match_confidence",
+            "matched_org_name",
+            "matched_ein",
+            "latest_booster_revenue",
+            "latest_booster_expenses",
+            "latest_booster_net_assets",
+            "latest_booster_tax_year",
+        ]
+    ]
+
+
 def _enrich_school_funding_fields(schools: pd.DataFrame, *, match_boosters: bool = True) -> pd.DataFrame:
     out = schools.copy()
     if len(out) == 0:
@@ -766,19 +861,21 @@ def _enrich_school_funding_fields(schools: pd.DataFrame, *, match_boosters: bool
         empty = bmf.iloc[:0]
         gz = bmf.groupby(["STATE", "ZIP"], sort=False)
         gs = bmf.groupby("STATE", sort=False)
-        sz_cache: dict[tuple[str, str], pd.DataFrame] = {}
-        state_cache: dict[str, pd.DataFrame] = {}
-
-        merged_rows: list[dict[str, object]] = []
-        for row in out.itertuples(index=False):
-            st = str(getattr(row, "state", "") or "").strip().upper()
-            zp = _zip_scalar(getattr(row, "zip_code", ""))
-            cty = str(getattr(row, "city", "") or "").strip().lower()
-            loc = _resolve_booster_loc(st, zp, cty, gz, gs, sz_cache, state_cache, empty)
-            merged_rows.append(
-                _match_booster_for_school(getattr(row, "school_name", ""), cty, st, zp, loc)
-            )
-        match_df = pd.DataFrame(merged_rows, index=out.index)
+        if len(out) >= _BOOSTER_FAST_MATCH_MIN_ROWS:
+            match_df = _match_boosters_by_location_fast(out, gz, gs, empty)
+        else:
+            sz_cache: dict[tuple[str, str], pd.DataFrame] = {}
+            state_cache: dict[str, pd.DataFrame] = {}
+            merged_rows: list[dict[str, object]] = []
+            for row in out.itertuples(index=False):
+                st = str(getattr(row, "state", "") or "").strip().upper()
+                zp = _zip_scalar(getattr(row, "zip_code", ""))
+                cty = str(getattr(row, "city", "") or "").strip().lower()
+                loc = _resolve_booster_loc(st, zp, cty, gz, gs, sz_cache, state_cache, empty)
+                merged_rows.append(
+                    _match_booster_for_school(getattr(row, "school_name", ""), cty, st, zp, loc)
+                )
+            match_df = pd.DataFrame(merged_rows, index=out.index)
         for c in match_df.columns:
             out[c] = match_df[c]
 
