@@ -428,7 +428,7 @@ if page == "Matrix Overview":
         )
         st.markdown("##### Overall balance")
         need_pct = st.slider(
-            "Need weight (%)",
+            "Slidebar displayed is out of 100. The need weight % is in red, while the feasibility is in grey. The slider is the overall balance of need and feasibility.",
             min_value=0,
             max_value=100,
             key="overall_need_pct",
@@ -583,7 +583,7 @@ if page == "Matrix Overview":
 else:
     st.sidebar.subheader("Scoring weights")
     need_pct = st.sidebar.slider(
-        "Need weight (%)",
+        "Slidebar displayed is out of 100. The need weight % is in red, while the feasibility is in grey. The slider is the overall balance of need and feasibility.",
         min_value=0,
         max_value=100,
         key="overall_need_pct",
